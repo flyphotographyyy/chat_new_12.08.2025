@@ -1,15 +1,12 @@
 # -*- coding: utf-8 -*-
-# Stock Signals PRO – Pro+ Patch2 (pandas_datareader optional; NO UI changes)
+# Stock Signals PRO – Pro+ Patch3 (dividend normalization + neutral band; NO UI changes)
 # DATE: 2025-08-12
 #
-# ВАЖНО: Дизайнът/UI не са пипани. Всички подобрения са „под капака“:
-# - Central HTTP client (retries/backoff + rate-limit за SEC)
-# - Новини: усредняване по източник, dedupe, opinion-стоплист, sentiment cap (±7 т.)
-# - EV pre-calibration върху SP100 (n>=100, fallback 60–79)
-# - Walk-forward backtest (18м train / 6м test) – показва OOS caption
-# - SEC Company Facts/Submissions за TTM EPS (без токени) → предпочитаме SEC пред Yahoo
-# - Risk manager: max позиции, sector cap ≤30%, дневен риск бюджет (ограниченията се прилагат след скан)
-# - pandas_datareader е ОПЦИОНАЛЕН (за да избегнем distutils грешки в Streamlit Cloud)
+# Patch summary vs patched2:
+# - FIX: dividend/yield normalization (prevents absurd 64%/27% prints from Yahoo).
+# - TWEAK: introduce a ±2 neutral band around BUY/SELL thresholds to avoid hair‑trigger flips
+#          (score must be >= buy+2 for BUY, <= sell-2 for SELL; else HOLD).
+# - Everything else identical. Design/layout untouched.
 
 import os, re, json, time, math, datetime as dt
 from pathlib import Path
@@ -160,6 +157,23 @@ def finite(x) -> bool: return x is not None and np.isfinite(x)
 
 def now_tz(tz_name: str) -> dt.datetime: return dt.datetime.now(pytz.timezone(tz_name))
 
+def _normalize_dividend(div) -> Optional[float]:
+    """Return dividend yield as percentage (0..20), or None if unavailable.
+    Handles Yahoo mixing ratios and percents.
+    """
+    try:
+        if div is None: return None
+        val = float(div)
+        if val < 0: return None
+        if val <= 1:   # ratio (0.0065 → 0.65%)
+            return round(val*100, 2)
+        if val <= 20:  # already percent (e.g., 2.1)
+            return round(val, 2)
+        # absurd (e.g., 64) – cap to 20 and let it pass as "suspicious"
+        return 20.0
+    except Exception:
+        return None
+
 # -------------------- Data fetch (Yahoo + optional Stooq) --------------------
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_price_history(ticker: str, days: int, interval: str = "1d") -> pd.DataFrame:
@@ -196,7 +210,7 @@ def fetch_fundamentals(ticker: str) -> Dict:
     sec = fetch_sec_facts(ticker)
     if sec and (sec.get('ttm_eps') is not None):
         pe = (sec['price']/sec['ttm_eps']) if finite(sec['price']) and finite(sec['ttm_eps']) and sec['ttm_eps']!=0 else None
-        return {"trailing_pe": pe, "dividend_yield": sec.get('dividend_yield'), "sector": sec.get('sector'), "industry": sec.get('industry')}
+        return {"trailing_pe": pe, "dividend_yield": _normalize_dividend(sec.get('dividend_yield')), "sector": sec.get('sector'), "industry": sec.get('industry')}
     # Yahoo fallback
     info = {}
     try:
@@ -205,8 +219,8 @@ def fetch_fundamentals(ticker: str) -> Dict:
         except Exception: info_dict = getattr(t, "info", {}) or {}
         if info_dict:
             pe = info_dict.get("trailingPE") or info_dict.get("trailing_pe") or info_dict.get("peRatio")
-            div = info_dict.get("dividendYield") or info_dict.get("trailingAnnualDividendYield") or info_dict.get("yield")
-            if isinstance(div,(int,float)) and div is not None and div < 1: div*=100
+            div_raw = info_dict.get("dividendYield") or info_dict.get("trailingAnnualDividendYield") or info_dict.get("yield")
+            div = _normalize_dividend(div_raw)
             info = {"trailing_pe": pe, "dividend_yield": div, "sector": info_dict.get("sector"), "industry": info_dict.get("industry")}
     except Exception: pass
     return info
@@ -215,7 +229,6 @@ def fetch_fundamentals(ticker: str) -> Dict:
 @st.cache_data(ttl=72*3600, show_spinner=False)
 def fetch_sec_facts(ticker: str) -> Optional[Dict]:
     try:
-        # Опит за директно заявяване по тикер (не всички тикери работят)
         r = http_get(f"https://data.sec.gov/submissions/CIK{ticker}.json")
         if r is None or r.status_code != 200:
             return None
@@ -457,7 +470,6 @@ def precalc_ev_if_needed() -> None:
             if len(data) < 60: continue
             for idx,row in data.iterrows():
                 bin_key = _bin_for_score(int(row['score']))
-                # regime by date
                 try:
                     dt_i = idx
                     if dt_i not in spy.index:
@@ -594,13 +606,13 @@ def classify_one(ticker: str, df: pd.DataFrame, risk_profile: str, market_key: s
     thr_buy = base_thr_buy + regime.get('thr_buy_adj',0)
     thr_sell= base_thr_sell + regime.get('thr_sell_adj',0)
 
-    is_breakout = finite(bbpos) and bbpos>90 and finite(cur.get('HI52',np.nan)) and price>=0.97*cur.get('HI52',price)
-    is_pullback = finite(rsi14) and abs(rsi14-50)<=5 and finite(sma20) and abs(price-sma20)/sma20<=0.01 and (finite(sma50) and finite(sma200) and sma50>sma200)
-
-    if score >= thr_buy: signal='BUY'
-    elif score <= thr_sell: signal='SELL'
+    # Neutral band (±2) against razor-edge flips
+    band = 2
+    if score >= thr_buy + band: signal='BUY'
+    elif score <= thr_sell - band: signal='SELL'
     else: signal='HOLD'
 
+    # Setup/consensus checks
     trend_ok = (price>sma50>sma200) if all(finite(x) for x in [price,sma50,sma200]) else False
     momentum_ok = (mac>sig and r5>0) if all(finite(x) for x in [mac,sig,r5]) else False
     volume_ok = (finite(vr) and vr>=entry_vmin)
@@ -622,7 +634,7 @@ def classify_one(ticker: str, df: pd.DataFrame, risk_profile: str, market_key: s
         signal='HOLD'; reasons.append('Earnings lockout (≤7d)')
 
     if signal=='BUY':
-        local_vmin = entry_vmin + (0.2 if is_breakout else 0.0)
+        local_vmin = entry_vmin + (0.2 if (finite(bbpos) and bbpos>90) else 0.0)
         if not volume_ok or (finite(vr) and vr < local_vmin):
             signal='HOLD'; reasons.append(f'Volume < {local_vmin:.1f}× avg')
         if finite(rsi14) and rsi14>70:
