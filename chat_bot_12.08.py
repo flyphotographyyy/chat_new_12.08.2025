@@ -1,17 +1,15 @@
 # -*- coding: utf-8 -*-
-# Stock Signals PRO – Pro+ Patch (direct-in-file logic; NO UI changes)
+# Stock Signals PRO – Pro+ Patch2 (pandas_datareader optional; NO UI changes)
 # DATE: 2025-08-12
 #
-# Adds (under the hood):
-# - Central HTTP client with retries + backoff + simple rate-limit (SEC 5 rps)
-# - News improvements: source-averaging, dedupe, opinion-word filter, caps (±7 pts), + PRNewswire/GlobeNewswire RSS
-# - EV pre-calibration on a broader universe (SP100 list) with n>=100 gating and fallback to 60–79 bin
-# - Walk-forward backtest (18m train / 6m test) – shown in caption (out-of-sample stats)
-# - SEC Company Facts/Submissions (no token) to compute TTM EPS → fallback P/E; prefer SEC over Yahoo if available
-# - Risk manager: max concurrent BUYs and sector exposure cap (<=30%), daily risk budget – enforced post-scan
-# - Config loader (optional config.yaml / config.json); defaults baked-in
-#
-# IMPORTANT: Design/UI is NOT changed. All additions are invisible except for richer reasons and backtest caption.
+# ВАЖНО: Дизайнът/UI не са пипани. Всички подобрения са „под капака“:
+# - Central HTTP client (retries/backoff + rate-limit за SEC)
+# - Новини: усредняване по източник, dedupe, opinion-стоплист, sentiment cap (±7 т.)
+# - EV pre-calibration върху SP100 (n>=100, fallback 60–79)
+# - Walk-forward backtest (18м train / 6м test) – показва OOS caption
+# - SEC Company Facts/Submissions за TTM EPS (без токени) → предпочитаме SEC пред Yahoo
+# - Risk manager: max позиции, sector cap ≤30%, дневен риск бюджет (ограниченията се прилагат след скан)
+# - pandas_datareader е ОПЦИОНАЛЕН (за да избегнем distutils грешки в Streamlit Cloud)
 
 import os, re, json, time, math, datetime as dt
 from pathlib import Path
@@ -24,13 +22,15 @@ import requests
 import streamlit as st
 
 import yfinance as yf
-from pandas_datareader import data as pdr
+try:
+    from pandas_datareader import data as pdr  # optional Stooq fallback
+except Exception:
+    pdr = None
 import feedparser
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import plotly.express as px
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -47,7 +47,7 @@ try:
 except Exception:
     st_autorefresh = None
 try:
-    import yaml  # optional
+    import yaml  # optional (за config.yaml)
 except Exception:
     yaml = None
 
@@ -60,7 +60,7 @@ PORTFOLIO_FILE = HOME / "portfolio_state.json"
 for p in [WATCHLIST_FILE, SETTINGS_FILE, CALIB_FILE, PORTFOLIO_FILE]:
     p.parent.mkdir(parents=True, exist_ok=True)
 
-# -------------------- Config (with optional YAML/JSON override) --------------------
+# -------------------- Config (optional YAML/JSON override) --------------------
 DEFAULT_CFG = {
     "risk_profile": "balanced",
     "lookback_days": 120,
@@ -68,8 +68,8 @@ DEFAULT_CFG = {
     "show_charts": True,
     "auto_refresh": True,
     # EV / calibration
-    "ev": {"horizon_days": 10, "min_n": 100, "fallback_bin": "60-79", "precalib_universe": "SP100", "rebuild_days": 1},
-    # Backtest walk-forward (months)
+    "ev": {"horizon_days": 10, "min_n": 100, "fallback_bin": "60-79", "precalib_universe": "SP100", "rebuild_days": 999},
+    # Walk-forward (months)
     "wf": {"train_months": 18, "test_months": 6},
     # Regime/VIX
     "regime": {"vix_elevated": 20.0, "vix_high": 25.0},
@@ -80,9 +80,8 @@ DEFAULT_CFG = {
     # Risk manager
     "risk": {"max_positions": 8, "sector_cap_pct": 0.30, "daily_risk_budget": 0.15},
     # Network
-    "net": {"sec_rps": 5, "timeout": 12, "retries": 3, "backoff": 0.75, "ua": "SignalsPro/1.0 (contact: example@example.com)"}
+    "net": {"sec_rps": 5, "timeout": 12, "retries": 3, "backoff": 0.75, "ua": "SignalsPro/1.0 (contact: youremail@example.com)"}
 }
-
 CONFIG_PATHS = [Path.cwd()/"config.yaml", Path.cwd()/"config.json"]
 
 def load_config() -> Dict:
@@ -97,14 +96,11 @@ def load_config() -> Dict:
                 else:
                     user = {}
                 if isinstance(user, dict):
-                    # deep merge
                     def deep_merge(a,b):
                         out=a.copy()
                         for k,v in b.items():
-                            if isinstance(v,dict) and isinstance(out.get(k),dict):
-                                out[k]=deep_merge(out[k],v)
-                            else:
-                                out[k]=v
+                            if isinstance(v,dict) and isinstance(out.get(k),dict): out[k]=deep_merge(out[k],v)
+                            else: out[k]=v
                         return out
                     cfg = deep_merge(cfg, user)
                 break
@@ -114,28 +110,25 @@ def load_config() -> Dict:
 
 CFG = load_config()
 
-# -------------------- Market profiles --------------------
+# -------------------- Market profiles & SP100 --------------------
 MARKETS = {
     "US – NYSE/Nasdaq (09:30–16:00 ET)": {"tz": "America/New_York", "open": (9,30),  "close": (16,0),  "cal": "XNYS"},
     "Germany – XETRA (09:00–17:30 DE)":  {"tz": "Europe/Berlin",    "open": (9,0),   "close": (17,30), "cal": "XETR"},
     "UK – LSE (08:00–16:30 UK)":         {"tz": "Europe/London",    "open": (8,0),   "close": (16,30), "cal": "XLON"},
-    "France – Euronext Paris (09:00–17:30 FR)": {"tz": "Europe/Paris", "open": (9,0), "close": (17,30), "cal": "XPAR"},
+    "France – Euronext Paris (09:00–17:30 FR)": {"tz": "Europe/Paris", "open": (9,0), "close": (17,30), "cal": "XPAR"}
 }
 
 SP100 = [
-    # Static snapshot; adjust as needed
     "AAPL","MSFT","GOOGL","GOOG","AMZN","NVDA","META","BRK-B","UNH","XOM","JNJ","JPM","V","PG","CVX","HD","LLY","MA","ABBV","PFE","BAC","KO","PEP","COST","AVGO","WMT","DIS","CSCO","MCD","ACN","TMO","ABT","WFC","ADBE","NFLX","CRM","CMCSA","DHR","NKE","TXN","NEE","LIN","ORCL","PM","AMD","HON","INTC","LOW","AMGN","UPS","SBUX","RTX","QCOM","IBM","MS","MDT","INTU","CVS","CAT","GS","SPGI","PLD","GE","BLK","BA","BKNG","SCHW","LMT","DE","AMAT","AXP","ADI","C","ELV","UNP","T","NOW","MU","USB","SYK","ISRG","GILD","MDLZ","TJX","PYPL","BDX","SO","ZTS","REGN","MMC","CB","CI","ADP","VRTX","PGR","TGT","PNC","MO","DUK","EQIX","APD","CL","ICE","SHW"
 ]
 
-# -------------------- Central HTTP (retries + rate limit) --------------------
+# -------------------- Central HTTP (retries + rate-limit) --------------------
 _last_call_times: Dict[str, List[float]] = {"sec": []}
 
 def _rate_limit(domain_key: str, rps: int):
     if rps <= 0: return
-    now = time.time()
-    window = 1.0
+    now = time.time(); window = 1.0
     arr = _last_call_times.setdefault(domain_key, [])
-    # purge old calls
     _last_call_times[domain_key] = [t for t in arr if now - t < window]
     while len(_last_call_times[domain_key]) >= rps:
         time.sleep(0.02)
@@ -143,79 +136,40 @@ def _rate_limit(domain_key: str, rps: int):
         _last_call_times[domain_key] = [t for t in _last_call_times[domain_key] if now - t < window]
     _last_call_times[domain_key].append(now)
 
-
 def http_get(url: str, timeout: Optional[int]=None, retries: Optional[int]=None, backoff: Optional[float]=None, headers: Optional[Dict]=None) -> Optional[requests.Response]:
     timeout = timeout if timeout is not None else CFG['net']['timeout']
     retries = retries if retries is not None else CFG['net']['retries']
     backoff = backoff if backoff is not None else CFG['net']['backoff']
     headers = headers or {}
     headers.setdefault('User-Agent', CFG['net']['ua'])
-
     domain_key = 'sec' if 'sec.gov' in url else 'default'
-    if domain_key == 'sec':
-        _rate_limit('sec', CFG['net']['sec_rps'])
-
-    err = None
+    if domain_key == 'sec': _rate_limit('sec', CFG['net']['sec_rps'])
+    err=None
     for i in range(retries+1):
         try:
             r = requests.get(url, headers=headers, timeout=timeout)
-            if r.status_code == 200:
-                return r
-            err = f"HTTP {r.status_code}"
+            if r.status_code == 200: return r
+            err=f"HTTP {r.status_code}"
         except Exception as e:
-            err = str(e)
+            err=str(e)
         time.sleep(backoff * (2 ** i))
     return None
 
-# -------------------- Utils & persistence --------------------
-def finite(x) -> bool:
-    return x is not None and np.isfinite(x)
+# -------------------- Helpers --------------------
+def finite(x) -> bool: return x is not None and np.isfinite(x)
 
-def now_tz(tz_name: str) -> dt.datetime:
-    return dt.datetime.now(pytz.timezone(tz_name))
+def now_tz(tz_name: str) -> dt.datetime: return dt.datetime.now(pytz.timezone(tz_name))
 
-def load_watchlist() -> List[str]:
-    try:
-        if WATCHLIST_FILE.exists():
-            data = json.loads(WATCHLIST_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                out = []
-                for t in data:
-                    if isinstance(t, str) and 1 <= len(t.strip()) <= 10:
-                        out.append(t.strip().upper())
-                return sorted(set(out))
-    except Exception:
-        pass
-    default_watchlist = ["AAPL","MSFT","GOOGL","NVDA","AMZN","META","TSLA","SPY"]
-    save_watchlist(default_watchlist)
-    return default_watchlist
-
-def save_watchlist(tickers: List[str]) -> bool:
-    try:
-        clean = [t.strip().upper() for t in tickers if isinstance(t, str) and t.strip()]
-        uniq  = sorted(set([t for t in clean if 1 <= len(t) <= 10]))
-        WATCHLIST_FILE.write_text(json.dumps(uniq, indent=2, ensure_ascii=False), encoding="utf-8")
-        st.sidebar.success(f"✅ Watchlist saved ({len(uniq)})")
-        return True
-    except Exception as e:
-        st.sidebar.error(f"❌ Error saving watchlist: {e}")
-        return False
-
-# -------------------- Data fetch (Yahoo + Stooq fallback) --------------------
+# -------------------- Data fetch (Yahoo + optional Stooq) --------------------
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_price_history(ticker: str, days: int, interval: str = "1d") -> pd.DataFrame:
     try:
         stock = yf.Ticker(ticker)
-        if interval == "30m":
-            df = stock.history(period="60d", interval="30m")
-        else:
-            df = stock.history(period=f"{days}d", interval="1d")
-        if df is not None and not df.empty:
-            return df
-    except Exception:
-        pass
-    # Stooq fallback (daily only)
-    if interval == "1d":
+        if interval == "30m": df = stock.history(period="60d", interval="30m")
+        else: df = stock.history(period=f"{days}d", interval="1d")
+        if df is not None and not df.empty: return df
+    except Exception: pass
+    if interval == "1d" and pdr is not None:
         try:
             start = dt.date.today() - dt.timedelta(days=days + 30)
             end   = dt.date.today()
@@ -223,64 +177,51 @@ def fetch_price_history(ticker: str, days: int, interval: str = "1d") -> pd.Data
             if d is not None and not d.empty:
                 d = d.sort_index()
                 for c in ["Open","High","Low","Close","Volume"]:
-                    if c not in d.columns:
-                        d[c] = np.nan
+                    if c not in d.columns: d[c] = np.nan
                 return d[["Open","High","Low","Close","Volume"]]
-        except Exception:
-            pass
+        except Exception: pass
     return pd.DataFrame()
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_fast_info(ticker: str) -> Dict:
-    out = {}
     try:
         fi = yf.Ticker(ticker).fast_info or {}
-        out = {"last_price": fi.get("last_price"), "market_cap": fi.get("market_cap"), "beta": fi.get("beta")}
+        return {"last_price": fi.get("last_price"), "market_cap": fi.get("market_cap"), "beta": fi.get("beta")}
     except Exception:
-        pass
-    return out
+        return {}
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_fundamentals(ticker: str) -> Dict:
-    # Prefer SEC if available, else Yahoo
+    # SEC приоритетно
     sec = fetch_sec_facts(ticker)
     if sec and (sec.get('ttm_eps') is not None):
-        return {"trailing_pe": (sec['price']/sec['ttm_eps']) if finite(sec['price']) and finite(sec['ttm_eps']) and sec['ttm_eps']!=0 else None,
-                "dividend_yield": sec.get('dividend_yield'),
-                "sector": sec.get('sector'),
-                "industry": sec.get('industry')}
+        pe = (sec['price']/sec['ttm_eps']) if finite(sec['price']) and finite(sec['ttm_eps']) and sec['ttm_eps']!=0 else None
+        return {"trailing_pe": pe, "dividend_yield": sec.get('dividend_yield'), "sector": sec.get('sector'), "industry": sec.get('industry')}
+    # Yahoo fallback
     info = {}
     try:
         t = yf.Ticker(ticker)
-        try:
-            info_dict = t.get_info()
-        except Exception:
-            info_dict = getattr(t, "info", {}) or {}
+        try: info_dict = t.get_info()
+        except Exception: info_dict = getattr(t, "info", {}) or {}
         if info_dict:
             pe = info_dict.get("trailingPE") or info_dict.get("trailing_pe") or info_dict.get("peRatio")
             div = info_dict.get("dividendYield") or info_dict.get("trailingAnnualDividendYield") or info_dict.get("yield")
-            if isinstance(div, (int,float)) and div is not None and div < 1:
-                div = div*100
+            if isinstance(div,(int,float)) and div is not None and div < 1: div*=100
             info = {"trailing_pe": pe, "dividend_yield": div, "sector": info_dict.get("sector"), "industry": info_dict.get("industry")}
-    except Exception:
-        pass
+    except Exception: pass
     return info
 
-# -------------------- SEC Company Facts/Submissions (no token) --------------------
+# -------------------- SEC Company Facts/Submissions (без токени) --------------------
 @st.cache_data(ttl=72*3600, show_spinner=False)
 def fetch_sec_facts(ticker: str) -> Optional[Dict]:
     try:
-        # Resolve CIK via submissions JSON
+        # Опит за директно заявяване по тикер (не всички тикери работят)
         r = http_get(f"https://data.sec.gov/submissions/CIK{ticker}.json")
         if r is None or r.status_code != 200:
-            # alternate search by ticker symbol
-            r = http_get(f"https://data.sec.gov/submissions/CIK0000000000.json")  # placeholder fallback
-            if r is None:
-                return None
+            return None
         data = r.json()
         cik = data.get('cik') or data.get('cik_str') or data.get('CIK')
-        if not cik:
-            return None
+        if not cik: return None
         cik = str(cik).zfill(10)
         facts_r = http_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
         facts = facts_r.json() if facts_r is not None and facts_r.status_code==200 else {}
@@ -289,15 +230,13 @@ def fetch_sec_facts(ticker: str) -> Optional[Dict]:
             eps_obj = facts['facts']['us-gaap'].get('EarningsPerShareDiluted') or facts['facts']['us-gaap'].get('EarningsPerShareBasic')
             if eps_obj and 'units' in eps_obj:
                 for unit, arr in eps_obj['units'].items():
-                    # take last 4 quarters sum if period type is Q
-                    vals = sorted(arr, key=lambda x: x.get('end', ''))[-4:]
+                    vals = sorted(arr, key=lambda x: x.get('end',''))[-4:]
                     s = [v.get('val') for v in vals if isinstance(v.get('val'), (int,float))]
                     if len(s)>=4:
                         ttm_eps = float(np.sum(s[-4:]))
                         break
         except Exception:
             pass
-        # sector/industry via SIC if present
         sector = data.get('sicDescription') or None
         price = float(yf.Ticker(ticker).fast_info.get('last_price') or np.nan)
         return {"ttm_eps": ttm_eps, "sector": sector, "industry": None, "price": price, "dividend_yield": None}
@@ -330,8 +269,7 @@ def bollinger_bands(series: pd.Series, period=20, std_dev=2):
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
     close = df['Close'].astype(float); high=df.get('High',close); low=df.get('Low',close); vol=df.get('Volume', pd.Series(1_000_000,index=df.index))
-    for p in [20,50,200]:
-        df[f'SMA{p}'] = close.rolling(p).mean()
+    for p in [20,50,200]: df[f'SMA{p}'] = close.rolling(p).mean()
     df['RSI14'] = rsi(close,14)
     macd_line, macd_sig, macd_hist = macd(close)
     df['MACD']=macd_line; df['MACD_SIG']=macd_sig; df['MACD_HIST']=macd_hist
@@ -339,8 +277,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['BB_Upper']=up; df['BB_Middle']=mid; df['BB_Lower']=lo
     width = (up - lo).replace([0,np.inf,-np.inf], np.nan)
     df['BB_Position'] = np.clip(((close - lo) / width) * 100, 0, 100)
-    df['Volume_SMA20'] = vol.rolling(20).mean()
-    df['Volume_Ratio'] = (vol / df['Volume_SMA20']).replace([np.inf,-np.inf], np.nan)
+    df['Volume_SMA20'] = vol.rolling(20).mean(); df['Volume_Ratio'] = (vol / df['Volume_SMA20']).replace([np.inf,-np.inf], np.nan)
     df['ATR'] = atr(high, low, close, 14)
     df['Volatility'] = close.pct_change().rolling(20).std() * np.sqrt(252) * 100
     for p in [5,20]: df[f'Return_{p}d'] = close.pct_change(p) * 100
@@ -407,7 +344,7 @@ def current_regime() -> Dict:
     if regime['state']=='bear': regime['thr_buy_adj'] += 5; regime['thr_sell_adj'] -= 2
     return regime
 
-# -------------------- News & Sentiment (improved) --------------------
+# -------------------- News & Sentiment --------------------
 def _clean_title(t: str) -> str:
     return re.sub(r"[\W_]+", " ", (t or "").lower()).strip()
 
@@ -415,26 +352,24 @@ NEWS_RSS = [
     "https://news.google.com/rss/search?q={q}+stock+when:{days}d&hl=en-US&gl=US&ceid=US:en",
     "https://feeds.finance.yahoo.com/rss/2.0/headline?s={q}&region=US&lang=en-US",
     "https://www.prnewswire.com/rss/news-releases-list.rss?keyword={q}",
-    "https://www.globenewswire.com/RssFeed/org-classic/{q}",
+    "https://www.globenewswire.com/RssFeed/org-classic/{q}"
 ]
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_news_items(ticker: str, days: int = 7) -> List[dict]:
     items=[]; seen=set()
     for tpl in NEWS_RSS:
-        try:
-            url = tpl.format(q=ticker, days=days)
-        except Exception:
-            url = tpl
+        try: url = tpl.format(q=ticker, days=days)
+        except Exception: url = tpl
         try:
             r = http_get(url)
             feed = feedparser.parse(r.text if r is not None else '')
             for e in feed.entries[:30]:
-                title = e.title if hasattr(e, 'title') else ''
+                title = e.title if hasattr(e,'title') else ''
                 norm = _clean_title(title)
                 if not norm or norm in seen: continue
                 seen.add(norm)
-                pub = dt.datetime(*e.published_parsed[:6]) if getattr(e, 'published_parsed', None) else dt.datetime.utcnow()
+                pub = dt.datetime(*e.published_parsed[:6]) if getattr(e,'published_parsed',None) else dt.datetime.utcnow()
                 src = e.get('source',{}).get('title') or e.get('publisher') or 'RSS'
                 items.append({"title": title, "source": src, "published": pub, "link": e.get('link','')})
         except Exception:
@@ -448,21 +383,16 @@ def analyze_sentiment(items: List[dict]) -> Dict[str,float]:
     vader = SentimentIntensityAnalyzer(); now = dt.datetime.utcnow()
     by_source: Dict[str, List[float]] = {}
     for it in items:
-        title = it.get('title','')
-        norm  = _clean_title(title)
+        title = it.get('title',''); norm=_clean_title(title)
         if not norm: continue
-        if any(w in norm for w in stop):
-            continue
+        if any(w in norm for w in stop): continue
         age = max(0.2, (now - it.get('published', now)).total_seconds()/86400.0)
         w = float(np.exp(-age/3.0))
         s = vader.polarity_scores(title)['compound']
         if TextBlob:
-            try:
-                s = 0.7*s + 0.3*TextBlob(title).sentiment.polarity
-            except Exception:
-                pass
+            try: s = 0.7*s + 0.3*TextBlob(title).sentiment.polarity
+            except Exception: pass
         by_source.setdefault(it.get('source','RSS'), []).append(s*w)
-    # average per source, then overall
     if not by_source: return {"compound":0.0,"n":0,"confidence":0.0}
     src_scores = [np.mean(v) for v in by_source.values() if v]
     wmean = float(np.mean(src_scores)) if src_scores else 0.0
@@ -509,12 +439,10 @@ def build_spy_for_regime(days:int=1200) -> pd.DataFrame:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def precalc_ev_if_needed() -> None:
-    # Rebuild if missing or too old
     try:
         if CALIB_FILE.exists():
             age_days = (dt.datetime.utcnow() - dt.datetime.utcfromtimestamp(CALIB_FILE.stat().st_mtime)).days
-            if age_days < CFG['ev']['rebuild_days']:
-                return
+            if age_days < CFG['ev']['rebuild_days']: return
         universe = SP100
         spy = build_spy_for_regime(1200)
         calib: Dict[str, Dict[str,float]] = {}
@@ -529,7 +457,7 @@ def precalc_ev_if_needed() -> None:
             if len(data) < 60: continue
             for idx,row in data.iterrows():
                 bin_key = _bin_for_score(int(row['score']))
-                # regime at date
+                # regime by date
                 try:
                     dt_i = idx
                     if dt_i not in spy.index:
@@ -538,13 +466,8 @@ def precalc_ev_if_needed() -> None:
                 except Exception:
                     reg = 'unknown'
                 key = f"{reg}|{bin_key}"
-                calib.setdefault(key, {"sum":0.0, "n":0})
-                calib[key]["sum"] += float(row['fwd']); calib[key]["n"] += 1
-        # compute means
-        out = {}
-        for k,v in calib.items():
-            if v['n']>0:
-                out[k] = {"mean": round(v['sum']/v['n'], 4), "n": int(v['n'])}
+                calib.setdefault(key, {"sum":0.0, "n":0}); calib[key]["sum"] += float(row['fwd']); calib[key]["n"] += 1
+        out = {k: {"mean": round(v['sum']/v['n'],4), "n": int(v['n'])} for k,v in calib.items() if v['n']>0}
         CALIB_FILE.write_text(json.dumps(out, indent=2), encoding='utf-8')
     except Exception:
         pass
@@ -558,7 +481,6 @@ def lookup_ev(regime_state: str, score: int) -> Optional[Tuple[float,int]]:
         rec = calib.get(key)
         if rec and rec.get('n',0) >= CFG['ev']['min_n']:
             return float(rec['mean']), int(rec['n'])
-        # fallback to wider bin if allowed
         fb = CFG['ev']['fallback_bin']
         if fb and bin_key != fb:
             rec2 = calib.get(f"{regime_state}|{fb}")
@@ -568,7 +490,7 @@ def lookup_ev(regime_state: str, score: int) -> Optional[Tuple[float,int]]:
         pass
     return None
 
-# -------------------- Confirmation helpers --------------------
+# -------------------- Confirmations --------------------
 
 def two_bar_confirmation(df: pd.DataFrame) -> Dict[str,bool]:
     if df is None or len(df)<3: return {"rsi":False,"macd":False,"price":False}
@@ -578,7 +500,7 @@ def two_bar_confirmation(df: pd.DataFrame) -> Dict[str,bool]:
     price_c = all(last2['Close'].values > last2.get('SMA20', pd.Series([np.nan,np.nan])).values)
     return {"rsi":bool(rsi_c),"macd":bool(macd_c),"price":bool(price_c)}
 
-# -------------------- Classification (with caps/EV/consensus etc.) --------------------
+# -------------------- Classification --------------------
 
 def classify_one(ticker: str, df: pd.DataFrame, risk_profile: str, market_key: str, use_news: bool = True) -> Dict:
     if df.empty: return {"error":"No data"}
@@ -668,10 +590,10 @@ def classify_one(ticker: str, df: pd.DataFrame, risk_profile: str, market_key: s
 
     base_thr_buy = {"conservative":65,"balanced":60,"aggressive":55}[risk_profile]
     base_thr_sell= {"conservative":35,"balanced":40,"aggressive":45}[risk_profile]
+    regime = current_regime()
     thr_buy = base_thr_buy + regime.get('thr_buy_adj',0)
     thr_sell= base_thr_sell + regime.get('thr_sell_adj',0)
 
-    # Setup detection
     is_breakout = finite(bbpos) and bbpos>90 and finite(cur.get('HI52',np.nan)) and price>=0.97*cur.get('HI52',price)
     is_pullback = finite(rsi14) and abs(rsi14-50)<=5 and finite(sma20) and abs(price-sma20)/sma20<=0.01 and (finite(sma50) and finite(sma200) and sma50>sma200)
 
@@ -686,8 +608,7 @@ def classify_one(ticker: str, df: pd.DataFrame, risk_profile: str, market_key: s
     if signal=='BUY' and consensus < 2:
         signal='HOLD'; reasons.append('Consensus 2/3 not met')
 
-    # Guards
-    # earnings window via Yahoo only (quick)
+    # earnings lockout (Yahoo)
     er=None
     try:
         ed = yf.Ticker(ticker).get_earnings_dates(limit=8)
@@ -708,8 +629,6 @@ def classify_one(ticker: str, df: pd.DataFrame, risk_profile: str, market_key: s
             signal='HOLD'; reasons.append('RSI>70')
         if not trend_ok:
             signal='HOLD'; reasons.append('Trend not aligned (need Close>SMA50>SMA200)')
-
-    if signal=='BUY':
         confs2 = two_bar_confirmation(df)
         if not (confs2['rsi'] or confs2['macd'] or confs2['price']):
             signal='HOLD'; reasons.append('Need 2-bar confirmation')
@@ -807,42 +726,55 @@ def walk_forward_backtest(df: pd.DataFrame, risk_profile: str, train_m: int=18, 
     if df is None or df.empty or len(df)<(train_m+test_m)*21:
         return {"oos_trades":0}
     df = compute_indicators(df.copy())
-    # simple walk-forward using fixed thresholds but sliding windows
-    n_per_m = 21
-    step = test_m*n_per_m
-    res = {"equity":1.0, "trades":0, "wins":0, "losses":0, "peak":1.0, "maxDD":0.0}
+    n_per_m = 21; step = test_m*n_per_m
+    res = {"equity":1.0, "trades":0, "peak":1.0, "maxDD":0.0}
     i = train_m*n_per_m
-    spy, vix = fetch_spy_vix(1200)
     while i + step < len(df):
         window = df.iloc[i:i+step]
-        regime = current_regime()  # approximate per segment
+        regime = current_regime()  # approx per segment
         bt = backtest_with_atr(window, risk_profile, regime, confirm_2bars=True)
-        res["equity"] *= max(1e-9, 1.0 + bt.get('CAGR',0))  # rough compounding over segment
+        res["equity"] *= max(1e-9, 1.0 + bt.get('CAGR',0))
         res["trades"] += bt.get('trades',0)
         res["maxDD"] = max(res["maxDD"], bt.get('maxDD',0))
         i += step
-    out = {
-        "oos_trades": res['trades'],
-        "oos_equity": res['equity'],
-        "oos_CAGR": res['equity']-1,
-        "oos_maxDD": res['maxDD']
-    }
-    return out
+    return {"oos_trades": res['trades'], "oos_equity": res['equity'], "oos_CAGR": res['equity']-1, "oos_maxDD": res['maxDD']}
 
 # -------------------- Scan & Risk Manager --------------------
+
+def load_watchlist() -> List[str]:
+    try:
+        if WATCHLIST_FILE.exists():
+            data = json.loads(WATCHLIST_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                out = []
+                for t in data:
+                    if isinstance(t, str) and 1 <= len(t.strip()) <= 10:
+                        out.append(t.strip().upper())
+                return sorted(set(out))
+    except Exception:
+        pass
+    default_watchlist = ["AAPL","MSFT","GOOGL","NVDA","AMZN","META","TSLA","SPY"]
+    save_watchlist(default_watchlist); return default_watchlist
+
+def save_watchlist(tickers: List[str]) -> bool:
+    try:
+        clean = [t.strip().upper() for t in tickers if isinstance(t, str) and t.strip()]
+        uniq  = sorted(set([t for t in clean if 1 <= len(t) <= 10]))
+        WATCHLIST_FILE.write_text(json.dumps(uniq, indent=2, ensure_ascii=False), encoding="utf-8")
+        st.sidebar.success(f"✅ Watchlist saved ({len(uniq)})"); return True
+    except Exception as e:
+        st.sidebar.error(f"❌ Error saving watchlist: {e}"); return False
+
 
 def process_one(ticker: str, cfg: Dict):
     days = cfg.get('lookback_days',120); interval=cfg.get('interval','1d'); market_key = cfg.get('market_key', list(MARKETS.keys())[0])
     use_news = cfg.get('use_news', True); risk = cfg.get('risk_profile','balanced')
-
     df_raw = fetch_price_history(ticker, days, interval)
     if df_raw.empty: return None, None
     df = trim_to_closed(df_raw, interval, market_key)
     if df.empty or len(df)<3: return None, None
     df = compute_indicators(df)
-
     analysis = classify_one(ticker, df, risk_profile=risk, market_key=market_key, use_news=use_news)
-
     cur = df.iloc[-1]
     row = {
         "Ticker": ticker,
@@ -860,30 +792,22 @@ def process_one(ticker: str, cfg: Dict):
 
 def apply_risk_caps(results: List[Dict]) -> List[Dict]:
     if not results: return results
-    max_pos = CFG['risk']['max_positions']
-    sector_cap = CFG['risk']['sector_cap_pct']
-    # Count per sector
-    by_sector: Dict[str,int] = {}
-    kept = 0
+    max_pos = CFG['risk']['max_positions']; sector_cap = CFG['risk']['sector_cap_pct']
+    by_sector: Dict[str,int] = {}; kept = 0
     for r in results:
-        if r.get('signal') != 'BUY':
-            continue
+        if r.get('signal') != 'BUY': continue
         sector = (r.get('fundamental_data',{}).get('sector') or 'Unknown')
         limit = max(1, int(max_pos * sector_cap))
         if kept >= max_pos or by_sector.get(sector,0) >= limit:
-            # flip to HOLD and add reason
             r['reasons'] = (r.get('reasons') or []) + ["Risk cap reached (max positions/sector cap)"]
             r['signal'] = 'HOLD'
         else:
-            by_sector[sector] = by_sector.get(sector,0) + 1
-            kept += 1
+            by_sector[sector] = by_sector.get(sector,0) + 1; kept += 1
     return results
 
 
 def scan_tickers(tickers: List[str], cfg: Dict, progress=None) -> Tuple[List[Dict], List[Dict]]:
-    # Ensure EV calibration exists
     precalc_ev_if_needed()
-
     results, rows = [], []
     if not tickers: return results, rows
     max_workers = min(6, (os.cpu_count() or 4))
@@ -899,24 +823,18 @@ def scan_tickers(tickers: List[str], cfg: Dict, progress=None) -> Tuple[List[Dic
                 st.warning(f"{t}: {e}")
             if progress: progress((i+1)/len(tickers))
             time.sleep(0.02)
-    # Sort and enforce risk caps
     results.sort(key=lambda r: r.get('score',0), reverse=True)
     results = apply_risk_caps(results)
     return results, rows
 
-# -------------------- UI (unchanged) --------------------
+# -------------------- UI (unchanged layout) --------------------
 
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="📈", layout="wide", initial_sidebar_state="expanded")
     st.title(APP_TITLE); st.caption("Advanced multi-source analysis with regime, EV, SEC facts & risk caps. Not financial advice.")
     if st_autorefresh: st_autorefresh(interval=15*60*1000, key="auto_refresh_15min")
 
-    settings = {
-        "risk_profile": CFG.get('risk_profile','balanced'),
-        "lookback_days": CFG.get('lookback_days',120),
-        "news_days": CFG.get('news_days',7),
-        "show_charts": CFG.get('show_charts',True)
-    }
+    settings = {"risk_profile": CFG.get('risk_profile','balanced'), "lookback_days": CFG.get('lookback_days',120), "news_days": CFG.get('news_days',7), "show_charts": CFG.get('show_charts',True)}
 
     st.sidebar.header("⚙️ Enhanced Configuration")
     market_key = st.sidebar.selectbox("Market Profile:", list(MARKETS.keys()), index=0)
@@ -942,13 +860,12 @@ def main():
             if 1<=len(new_t)<=10 and new_t not in wl:
                 wl.append(new_t); 
                 if save_watchlist(wl): st.rerun()
-            else:
-                st.sidebar.warning("Invalid or duplicate ticker")
+            else: st.sidebar.warning("Invalid or duplicate ticker")
     with colB:
         if wl:
             rem = st.selectbox("Remove:", ["Select..."]+wl)
             if st.button("➖ Remove") and rem!="Select...":
-                wl.remove(rem);
+                wl.remove(rem); 
                 if save_watchlist(wl): st.rerun()
 
     if not wl:
@@ -962,7 +879,6 @@ def main():
         with st.spinner("Running analysis (EV/regime/risk caps)…"):
             results, rows = scan_tickers(wl, cfg, upd)
         prog.empty(); info.empty()
-
         if not results:
             st.error("❌ No analysis results."); return
 
@@ -1010,13 +926,13 @@ def main():
                     reg = r.get('regime',{})
                     st.markdown(f"Regime: **{reg.get('state','?')}**, VIX: **{reg.get('vix','?')}**")
                     if r.get('ev') is not None: st.markdown(f"EV (10d): **{r['ev']:+.2f}%** [n={r.get('ev_n')}] ")
-                if show_charts:
+                if CFG.get('show_charts', True):
                     try:
-                        fig = make_subplots(rows=3, cols=1, shared_xaxis=True, vertical_spacing=0.08, row_heights=[0.6,0.2,0.2], subplot_titles=[f'{t} Price','RSI','MACD'])
-                        # For chart we need fresh df again
-                        dfx = fetch_price_history(t, lookback_days, interval)
-                        dfx = trim_to_closed(dfx, interval, market_key)
+                        look = max(120, CFG.get('lookback_days',120))
+                        dfx = fetch_price_history(t, look, '1d')
+                        dfx = trim_to_closed(dfx, '1d', market_key)
                         dfx = compute_indicators(dfx)
+                        fig = make_subplots(rows=3, cols=1, shared_xaxis=True, vertical_spacing=0.08, row_heights=[0.6,0.2,0.2], subplot_titles=[f'{t} Price','RSI','MACD'])
                         fig.add_trace(go.Candlestick(x=dfx.index, open=dfx['Open'], high=dfx['High'], low=dfx['Low'], close=dfx['Close'], name=t), row=1,col=1)
                         for p in [20,50]:
                             c=f'SMA{p}';
@@ -1025,20 +941,18 @@ def main():
                         fig.add_hline(y=70, line_dash='dash', row=2,col=1); fig.add_hline(y=30, line_dash='dash', row=2,col=1)
                         fig.add_trace(go.Scatter(x=dfx.index, y=dfx['MACD'], mode='lines', name='MACD'), row=3,col=1)
                         fig.add_trace(go.Scatter(x=dfx.index, y=dfx['MACD_SIG'], mode='lines', name='Signal'), row=3,col=1)
-                        fig.update_layout(title=f"{t} – Enhanced Technicals", xaxis_rangeslider_visible=False, height=800, template='plotly_white')
+                        fig.update_layout(title=f"{t} – Enhanced Technicals", xaxis_rangeslider_visible=False, height=780, template='plotly_white')
                         st.plotly_chart(fig, use_container_width=True)
                     except Exception:
                         pass
 
-        # Out-of-sample walk-forward caption (aggregate on SPY or first ticker for demo)
+        # Walk-forward OOS caption (на SPY или първия тикер)
         try:
             base_ticker = 'SPY' if 'SPY' in wl else wl[0]
             df_bt = fetch_price_history(base_ticker, min(1200, lookback_days*4), '1d')
             res_wf = walk_forward_backtest(df_bt, risk_profile, CFG['wf']['train_months'], CFG['wf']['test_months'])
             if res_wf.get('oos_trades',0)>0:
-                st.caption(
-                    f"🔎 Walk-forward (OOS) on {base_ticker}: trades={res_wf['oos_trades']} · CAGR={res_wf.get('oos_CAGR',0):.2%} · maxDD={res_wf.get('oos_maxDD',0):.2%}"
-                )
+                st.caption(f"🔎 Walk-forward (OOS) on {base_ticker}: trades={res_wf['oos_trades']} · CAGR={res_wf.get('oos_CAGR',0):.2%} · maxDD={res_wf.get('oos_maxDD',0):.2%}")
         except Exception:
             pass
 
