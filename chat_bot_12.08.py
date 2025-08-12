@@ -164,21 +164,20 @@ def finite(x) -> bool: return x is not None and np.isfinite(x)
 def now_tz(tz_name: str) -> dt.datetime: return dt.datetime.now(pytz.timezone(tz_name))
 
 def _normalize_dividend(div) -> Optional[float]:
-    """Return dividend yield as percentage (0..20), or None if unavailable.
-    Handles Yahoo mixing ratios and percents.
-    """
+    """Return dividend yield as percentage (0..20), or None if unavailable."""
     try:
-        if div is None: return None
+        if div is None:
+            return None
         val = float(div)
-        if val < 0: return None
-        if val <= 1:   # ratio (0.0065 → 0.65%)
-            return round(val*100, 2)
-        if val <= 20:  # already percent (e.g., 2.1)
-            return round(val, 2)
-        # absurd (e.g., 64) – cap to 20 and let it pass as "suspicious"
-        return 20.0
+        if val < 0:
+            return None
+        # normalize to percent
+        val = val * 100 if val <= 1 else val
+        # clamp to sensible range
+        return round(min(val, 20.0), 2)
     except Exception:
         return None
+
 
 # -------------------- Data fetch (Yahoo + optional Stooq) --------------------
 @st.cache_data(ttl=900, show_spinner=False)
