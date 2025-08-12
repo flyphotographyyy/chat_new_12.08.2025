@@ -11,3 +11,4 @@ vaderSentiment>=3.3.2
 textblob>=0.18.0.post0
 plotly>=5.24.0
 pandas_market_calendars>=4.4.0
+PyYAML>=6.0.1   # по избор; за config.yaml
