@@ -57,6 +57,12 @@ PORTFOLIO_FILE = HOME / "portfolio_state.json"
 for p in [WATCHLIST_FILE, SETTINGS_FILE, CALIB_FILE, PORTFOLIO_FILE]:
     p.parent.mkdir(parents=True, exist_ok=True)
 
+
+# ⬇️ копира калибрацията от репото към HOME (извън цикъла!)
+REPO_CALIB = Path.cwd() / "signals_ev_calibration.json"
+if REPO_CALIB.exists() and not CALIB_FILE.exists():
+    CALIB_FILE.write_text(REPO_CALIB.read_text(encoding="utf-8"), encoding="utf-8")
+
 # -------------------- Config (optional YAML/JSON override) --------------------
 DEFAULT_CFG = {
     "risk_profile": "balanced",
