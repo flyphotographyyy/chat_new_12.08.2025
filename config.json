@@ -37,6 +37,6 @@
     "timeout": 12,
     "retries": 3,
     "backoff": 0.75,
-    "ua": "SignalsPro/1.0 (contact: youremail@example.com)"
+    "ua": "SignalsPro/1.0 (contact: ale4ak@gmail.com)"
   }
 }
