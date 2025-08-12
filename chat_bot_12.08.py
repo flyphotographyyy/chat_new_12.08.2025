@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
 # Enhanced Stock Signals PRO – Multi-Source Analysis (Streamlit-ready)
+# PATCH 2025-08-12: 
+# - Signals only at CLOSED candles (no partial bar)
+# - Optional 2-candle confirmation for entries
+# - Hard guardrails: no BUY if VolumeRatio<1.3, RSI>70, trend misaligned, ER<=7d
+# - SEC RSS fallback for recent earnings filings (best-effort, no token)
+# - Backtest module with ATR stops & transaction costs (shown via existing toggle)
 
 import math, re, json, datetime as dt
 from pathlib import Path
@@ -219,6 +225,36 @@ def fetch_earnings_dates(ticker: str, limit: int = 6):
         return ed
     except Exception:
         return None
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_sec_recent_earnings_window(ticker: str) -> Optional[int]:
+    """SEC Atom feed best-effort: if recent earnings-related 8-K/10-Q within last 2 days -> return 0, else None.
+    This does NOT provide future dates; it's only a safety fallback when Yahoo fails."""
+    try:
+        # Use SEC browse endpoint; many tickers resolve without CIK.
+        url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={ticker}&type=8-K&owner=exclude&count=40&output=atom"
+        headers = {"User-Agent": "SignalsApp/1.0 (contact: example@example.com)"}
+        r = requests.get(url, headers=headers, timeout=10)
+        feed = feedparser.parse(r.text)
+        now = dt.datetime.utcnow()
+        for e in feed.entries[:20]:
+            title = (e.title or "").lower()
+            summ  = (getattr(e, "summary", "") or "").lower()
+            if any(k in title+summ for k in ["earnings", "results of operations", "quarterly results", "financial results"]):
+                pub = dt.datetime(*e.published_parsed[:6]) if getattr(e, "published_parsed", None) else now
+                if (now - pub).days <= 2:
+                    return 0
+        # Try 10-Q as well
+        url2 = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={ticker}&type=10-Q&owner=exclude&count=40&output=atom"
+        r2 = requests.get(url2, headers=headers, timeout=10)
+        feed2 = feedparser.parse(r2.text)
+        for e in feed2.entries[:10]:
+            pub = dt.datetime(*e.published_parsed[:6]) if getattr(e, "published_parsed", None) else now
+            if (now - pub).days <= 2:
+                return 0
+    except Exception:
+        pass
+    return None
 
 @st.cache_data(ttl=600, show_spinner=False)  # 10 minutes
 def fetch_news_items(ticker: str, days: int = 7) -> List[dict]:
@@ -468,18 +504,59 @@ def is_market_open_raw(profile_key: str) -> bool:
     c = now.replace(hour=ch, minute=cm, second=0, microsecond=0)
     return o <= now < c
 
+# -------------------- Candle handling --------------------
+def trim_to_closed_candles(df: pd.DataFrame, interval: str, market_key: str) -> pd.DataFrame:
+    """Drop the last (possibly partial) bar to ensure signals only use CLOSED candles."""
+    if df is None or df.empty:
+        return df
+    try:
+        is_open = cached_is_market_open(market_key)
+    except Exception:
+        is_open = False
+
+    idx = df.index
+    if not isinstance(idx, pd.DatetimeIndex):
+        return df
+
+    df2 = df.copy()
+
+    if interval == "30m":
+        # If market is open, the last 30m bar is still forming -> drop it
+        if is_open and len(df2) > 1:
+            df2 = df2.iloc[:-1]
+    elif interval == "1d":
+        # If today is last row and market not yet closed, drop today's row
+        prof = MARKETS.get(market_key)
+        if prof:
+            tz = pytz.timezone(prof["tz"]) 
+            now_local = dt.datetime.now(tz)
+            last = idx[-1].tz_localize(tz) if idx.tz is None else idx[-1].tz_convert(tz)
+            (oh,om),(ch,cm) = prof["open"], prof["close"]
+            close_today = now_local.replace(hour=ch, minute=cm, second=0, microsecond=0)
+            if last.date() == now_local.date() and now_local < close_today and len(df2) > 1:
+                df2 = df2.iloc[:-1]
+    return df2
+
 # -------------------- Extra analytics --------------------
 def earnings_in_days(ticker: str, horizon: int = 14) -> Optional[int]:
     ed = fetch_earnings_dates(ticker, limit=6)
-    if ed is None or len(ed)==0: return None
-    try:
-        idx = ed.index.tz_localize(None)
-    except Exception:
-        idx = ed.index
-    now = dt.datetime.utcnow()
-    diffs = [(d.to_pydatetime() - now).days for d in idx if (d.to_pydatetime() - now).days >= 0]
-    if not diffs: return None
-    dmin = min(diffs)
+    dmin = None
+    if ed is not None and len(ed)>0:
+        try:
+            idx = ed.index.tz_localize(None)
+        except Exception:
+            idx = ed.index
+        now = dt.datetime.utcnow()
+        future = [(d.to_pydatetime() - now).days for d in idx if (d.to_pydatetime() - now).days >= 0]
+        if future:
+            dmin = min(future)
+    # SEC fallback: recent filings imply event window today/0d
+    if dmin is None or dmin > horizon:
+        sec_days = fetch_sec_recent_earnings_window(ticker)
+        if sec_days is not None:
+            dmin = sec_days
+    if dmin is None:
+        return None
     return dmin if dmin <= horizon else None
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -495,9 +572,26 @@ def relative_strength_20d(df_asset: pd.DataFrame, bench: str = "SPY") -> pd.Seri
 def finite(x) -> bool:
     return x is not None and np.isfinite(x)
 
+# -------------------- Confirmation helpers --------------------
+def two_bar_confirmation(df: pd.DataFrame) -> Dict[str,bool]:
+    """Return confirmation booleans based on last two CLOSED bars.
+    - rsi_confirm: RSI14 > 50 for last 2 bars
+    - macd_confirm: MACD > MACD_SIG for last 2 bars
+    - price_trend_confirm: Close > SMA20 for last 2 bars
+    """
+    if df is None or len(df) < 3:
+        return {"rsi": False, "macd": False, "price": False}
+    last2 = df.iloc[-2:]
+    rsi_c = all(finite(x) and x>50 for x in last2["RSI14"].tolist() if "RSI14" in df.columns)
+    macd_c = all((last2.get("MACD", pd.Series([np.nan,np.nan])).values > last2.get("MACD_SIG", pd.Series([np.nan,np.nan])).values))
+    price_c = all(last2["Close"].values > last2.get("SMA20", pd.Series([np.nan,np.nan])).values)
+    return {"rsi": bool(rsi_c), "macd": bool(macd_c), "price": bool(price_c)}
+
 # -------------------- Classification --------------------
 def enhanced_signal_classification(ticker: str, df: pd.DataFrame, news_sent: Dict,
-                                   risk_profile: str = "balanced", low_liquidity_cap: float = 1e9) -> Dict:
+                                   risk_profile: str = "balanced", low_liquidity_cap: float = 1e9,
+                                   hard_guards: bool = True, confirm_2bars: bool = True,
+                                   entry_volume_min: float = 1.3) -> Dict:
     if df.empty: return {"error":"No data"}
     cur = df.iloc[-1]
     prev = df.iloc[-2] if len(df)>=2 else cur
@@ -605,6 +699,32 @@ def enhanced_signal_classification(ticker: str, df: pd.DataFrame, news_sent: Dic
     elif score <= thr_sell:signal = "SELL"
     else:                  signal = "HOLD"
 
+    # ---- HARD GUARDRAILS (only restrict BUY) ----
+    if hard_guards and signal == "BUY":
+        guards_tripped = []
+        # Volume
+        if finite(vol_ratio) and vol_ratio < entry_volume_min:
+            guards_tripped.append(f"Volume < {entry_volume_min:.1f}× avg")
+        # Overbought RSI
+        if finite(rsi14) and rsi14 > 70:
+            guards_tripped.append("RSI>70")
+        # Trend alignment
+        if not (finite(sma50) and finite(sma200) and price > sma50 > sma200):
+            guards_tripped.append("Trend not aligned (need Close>SMA50>SMA200)")
+        # Earnings lockout
+        if er_days is not None and er_days <= 7:
+            guards_tripped.append("Earnings lockout (≤7d)")
+        if guards_tripped:
+            signal = "HOLD"
+            reasons.append("Guardrails: " + ", ".join(guards_tripped))
+
+    # ---- 2-candle confirmation (only for BUY) ----
+    if confirm_2bars and signal == "BUY":
+        confs = two_bar_confirmation(df)
+        if not (confs["rsi"] or confs["macd"] or confs["price"]):
+            signal = "HOLD"
+            reasons.append("Need 2-bar confirmation (RSI>50 or MACD>Signal or Close>SMA20 for 2 bars)")
+
     avg_conf = int(min(100, max(0, (np.mean(conf_factors) if conf_factors else 0.5)*100)))
 
     # Fundamentals enrich (from fast_info if DataFrame lacks)
@@ -622,7 +742,7 @@ def enhanced_signal_classification(ticker: str, df: pd.DataFrame, news_sent: Dic
         "confidence": avg_conf,
         "price": price,
         "signals_breakdown": signals,
-        "reasons": reasons[:8],
+        "reasons": reasons[:10],
         "sentiment": news_sent,
         "risk_profile": risk_profile,
         "fundamental_data": {
@@ -685,19 +805,120 @@ def create_enhanced_visualizations(df: pd.DataFrame, ticker: str) -> go.Figure:
     fig.update_yaxes(title_text="MACD",  row=3, col=1)
     return fig
 
-# -------------------- Backtest (simple demo) --------------------
-def simple_backtest(df: pd.DataFrame, hold_days: int = 10) -> Dict:
-    if df is None or df.empty or "RSI14" not in df.columns or "MACD" not in df.columns or "MACD_SIG" not in df.columns:
-        return {"buy_count":0,"buy_avg":0.0,"sell_count":0,"sell_avg":0.0}
-    fwd = df["Close"].pct_change(hold_days).shift(-hold_days)
-    buys  = df[(df["RSI14"] < 30) & (df["MACD"] > df["MACD_SIG"])]
-    sells = df[(df["RSI14"] > 70) & (df["MACD"] < df["MACD_SIG"])]
-    return {
-        "buy_count": int(buys.shape[0]),
-        "buy_avg": float(fwd.loc[buys.index].mean()*100),
-        "sell_count": int(sells.shape[0]),
-        "sell_avg": float(fwd.loc[sells.index].mean()*100),
-    }
+# -------------------- Backtest (robust) --------------------
+def _score_only_technicals(df_row: pd.Series) -> int:
+    """Lightweight scoring for backtest (no news/fundamentals)."""
+    score = 0
+    price = df_row.get("Close", np.nan)
+    sma20, sma50, sma200 = df_row.get("SMA20",np.nan), df_row.get("SMA50",np.nan), df_row.get("SMA200",np.nan)
+    rsi14 = df_row.get("RSI14", np.nan)
+    macd_, macds_ = df_row.get("MACD",np.nan), df_row.get("MACD_SIG",np.nan)
+    bb_pos = df_row.get("BB_Position", np.nan)
+    ret5, ret20 = df_row.get("Return_5d",np.nan), df_row.get("Return_20d",np.nan)
+    vol_ratio = df_row.get("Volume_Ratio", np.nan)
+
+    if all(finite(x) for x in [price, sma20, sma50, sma200]):
+        if price > sma20 > sma50 > sma200: score += 20
+        elif price < sma20 < sma50 < sma200: score -= 20
+        elif price > sma50: score += 8
+    if finite(rsi14):
+        if rsi14 < 30: score += 12
+        if rsi14 > 70: score -= 12
+    if all(finite(x) for x in [macd_, macds_]):
+        if macd_ > macds_: score += 6
+        else: score -= 2
+    if finite(bb_pos):
+        if bb_pos < 10: score += 6
+        if bb_pos > 90: score -= 6
+    if all(finite(x) for x in [ret5,ret20]):
+        if ret5>5 and ret20>10: score += 8
+        if ret5<-5 and ret20<-10: score -= 8
+    if finite(vol_ratio) and vol_ratio>1.5:
+        score += 4
+    score = int(np.interp(score, [-40, 40], [0, 100]))
+    return max(0, min(100, score))
+
+
+def backtest_with_atr(df: pd.DataFrame, risk_profile: str = "balanced",
+                       entry_volume_min: float = 1.3, confirm_2bars: bool = True,
+                       cost_bps: float = 10, slippage_bps: float = 10,
+                       atr_mult: float = 2.0) -> Dict:
+    """Long-only backtest using daily data, close-only entries, ATR trailing stop.
+    Uses technical score; ignores news/fundamentals historically for speed."""
+    if df is None or df.empty:
+        return {"trades":0}
+    df = df.copy()
+    if "ATR" not in df.columns:
+        df = compute_enhanced_indicators(df, INDICATOR_CONFIGS, ["RSI","MACD","Bollinger"])  # ensure basics
+
+    # Build per-row score & basic signal
+    scores = df.apply(_score_only_technicals, axis=1)
+    thr_buy = {"conservative":65,"balanced":60,"aggressive":55}[risk_profile]
+    thr_sell= {"conservative":35,"balanced":40,"aggressive":45}[risk_profile]
+
+    cash = 1.0
+    pos = 0.0
+    entry_px = 0.0
+    peak_equity = 1.0
+    max_dd = 0.0
+    wins=0; losses=0; trades=0
+
+    # Helper: confirmation
+    def confirmed(i):
+        if not confirm_2bars:
+            return True
+        if i < 2: return False
+        rsi_ok = all(df.iloc[i-k]["RSI14"]>50 for k in [0,1] if finite(df.iloc[i-k]["RSI14"]))
+        macd_ok = all(df.iloc[i-k]["MACD"]>df.iloc[i-k]["MACD_SIG"] for k in [0,1] if all(finite(x) for x in [df.iloc[i-k]["MACD"],df.iloc[i-k]["MACD_SIG"]]))
+        price_ok= all(df.iloc[i-k]["Close"]>df.iloc[i-k]["SMA20"] for k in [0,1] if all(finite(x) for x in [df.iloc[i-k]["Close"],df.iloc[i-k]["SMA20"]]))
+        return rsi_ok or macd_ok or price_ok
+
+    # Iterate over CLOSED bars only (use all rows except last as a precaution)
+    last = len(df)-1
+    for i in range(2, last):
+        row = df.iloc[i]
+        px = float(row["Close"]) if finite(row.get("Close", np.nan)) else None
+        if px is None: continue
+
+        # Update trailing stop if in position
+        if pos > 0:
+            # trailing stop based on entry ATR (static) or dynamic ATR; use dynamic for simplicity
+            stop = entry_px - atr_mult * float(df.iloc[i]["ATR"]) if finite(df.iloc[i]["ATR"]) else entry_px * 0.95
+            # Exit rule: score below sell threshold or price < stop
+            if scores.iloc[i] <= thr_sell or px < stop:
+                # Sell at close, subtract costs
+                sell_px = px * (1 - (cost_bps+slippage_bps)/1e4)
+                cash *= (sell_px / entry_px)
+                pos = 0.0; trades += 1
+                if sell_px > entry_px: wins += 1
+                else: losses += 1
+                peak_equity = max(peak_equity, cash)
+                max_dd = max(max_dd, 1 - cash/peak_equity)
+                continue
+
+        # Entry conditions (no open position)
+        if pos == 0:
+            if scores.iloc[i] >= thr_buy and confirmed(i):
+                # Guardrails at entry
+                if not (finite(row.get("Volume_Ratio", np.nan)) and row.get("Volume_Ratio", 0) >= entry_volume_min):
+                    continue
+                if finite(row.get("RSI14", np.nan)) and row.get("RSI14") > 70:
+                    continue
+                if not (finite(row.get("SMA50", np.nan)) and finite(row.get("SMA200", np.nan)) and px > row.get("SMA50") > row.get("SMA200")):
+                    continue
+                # Buy at close, add costs
+                buy_px = px * (1 + (cost_bps+slippage_bps)/1e4)
+                entry_px = buy_px
+                pos = 1.0
+                # (cash unchanged as we model equity curve multiplicatively)
+
+        # Update peak/maxDD even if flat
+        peak_equity = max(peak_equity, cash)
+        max_dd = max(max_dd, 1 - cash/peak_equity)
+
+    cagr = (cash ** (252/len(df))) - 1 if len(df)>252 else cash-1
+    win_rate = wins / trades * 100 if trades>0 else 0.0
+    return {"trades":trades, "final_equity":cash, "CAGR":cagr, "maxDD":max_dd, "win_rate":win_rate}
 
 # -------------------- Scanning (parallel) --------------------
 def process_one(ticker: str, config: Dict):
@@ -705,9 +926,15 @@ def process_one(ticker: str, config: Dict):
     interval = config.get("interval","1d")
     use_news = config.get("use_news", True)
     risk = config.get("risk_profile","balanced")
+    market_key = config.get("market_key", list(MARKETS.keys())[0])
 
-    df = fetch_price_history(ticker, days, interval)
-    if df.empty:
+    df_raw = fetch_price_history(ticker, days, interval)
+    if df_raw.empty:
+        return None, None
+
+    # Use CLOSED candles only for decisions
+    df = trim_to_closed_candles(df_raw, interval, market_key)
+    if df.empty or len(df) < 3:
         return None, None
 
     # Fundamentals (fast info + slower fundamentals; written to all rows for easy access)
@@ -737,7 +964,13 @@ def process_one(ticker: str, config: Dict):
         df["RS_20d_vs_SPY"] = np.nan
 
     news_sent = analyze_sentiment_enhanced(fetch_news_items(ticker, config.get("news_days",7))) if use_news else {}
-    analysis  = enhanced_signal_classification(ticker, df, news_sent, risk_profile=risk)
+    analysis  = enhanced_signal_classification(
+        ticker, df, news_sent,
+        risk_profile=risk,
+        hard_guards=True,
+        confirm_2bars=True,
+        entry_volume_min=1.3,
+    )
 
     cur = df.iloc[-1]
     row = {
@@ -868,6 +1101,7 @@ def main():
         "news_days": news_days,
         "risk_profile": risk_profile,
         "indicators": selected_ind,
+        "market_key": market_key,
     }
 
     if st.button("🚀 Run Enhanced Analysis", type="primary"):
@@ -910,7 +1144,7 @@ def main():
                 col1,col2 = st.columns([2,1])
                 with col1:
                     st.markdown("**Key Signals:**")
-                    for i, reason in enumerate(r.get("reasons",[])[:6], 1):
+                    for i, reason in enumerate(r.get("reasons",[])[:8], 1):
                         st.markdown(f"{i}. {reason}")
                     br = r.get("signals_breakdown",{})
                     if br:
@@ -936,6 +1170,7 @@ def main():
                 if show_charts:
                     try:
                         df_chart = fetch_price_history(t, lookback_days, interval)
+                        df_chart = trim_to_closed_candles(df_chart, interval, market_key)
                         if not df_chart.empty:
                             df_chart = compute_enhanced_indicators(df_chart, INDICATOR_CONFIGS, selected_ind)
                             df_chart["RS_20d_vs_SPY"] = relative_strength_20d(df_chart, "SPY")
@@ -946,11 +1181,15 @@ def main():
 
                 if enable_backtest:
                     try:
-                        df_bt = fetch_price_history(t, min(365*3, lookback_days*3), "1d")
+                        df_bt = fetch_price_history(t, min(365*5, lookback_days*3), "1d")
                         if not df_bt.empty:
                             df_bt = compute_enhanced_indicators(df_bt, INDICATOR_CONFIGS, selected_ind)
-                            res_bt = simple_backtest(df_bt, hold_days=backtest_hold)
-                            st.caption(f"🔎 Backtest (hold {backtest_hold}d): buys={res_bt['buy_count']} avg={res_bt['buy_avg']:.2f}% · sells={res_bt['sell_count']} avg={res_bt['sell_avg']:.2f}%")
+                            res_bt = backtest_with_atr(df_bt, risk_profile=risk_profile, entry_volume_min=1.3, confirm_2bars=True)
+                            st.caption(
+                                f"🔎 Backtest (ATR stop x2, costs {10+10}bps): "
+                                f"trades={res_bt['trades']} · CAGR={res_bt.get('CAGR',0):.2%} · "
+                                f"maxDD={res_bt.get('maxDD',0):.2%} · win={res_bt.get('win_rate',0):.1f}%"
+                            )
                     except Exception:
                         pass
 
