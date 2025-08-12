@@ -1,0 +1,42 @@
+{
+  "risk_profile": "balanced",
+  "lookback_days": 180,
+  "news_days": 7,
+  "show_charts": true,
+
+  "ev": {
+    "horizon_days": 10,
+    "min_n": 100,
+    "fallback_bin": "60-79",
+    "precalib_universe": "SP100",
+    "rebuild_days": 999
+  },
+
+  "wf": { "train_months": 18, "test_months": 6 },
+
+  "regime": { "vix_elevated": 20.0, "vix_high": 25.0 },
+
+  "volume": { "min_base": 1.1, "max_base": 1.5 },
+
+  "news": {
+    "sentiment_cap_points": 7,
+    "opinion_stoplist": [
+      "opinion", "rumor", "speculative", "blog",
+      "downgrade", "upgrade", "price target", "short seller"
+    ]
+  },
+
+  "risk": {
+    "max_positions": 8,
+    "sector_cap_pct": 0.30,
+    "daily_risk_budget": 0.15
+  },
+
+  "net": {
+    "sec_rps": 5,
+    "timeout": 12,
+    "retries": 3,
+    "backoff": 0.75,
+    "ua": "SignalsPro/1.0 (contact: youremail@example.com)"
+  }
+}
